@@ -1,0 +1,444 @@
+// ── SC2 (v5/v6) Replace ──────────────────────────────────────────────────────
+//
+// Стратегия: НЕ пересобираем FlatBuffers-структуры с нуля (Header,
+// DataStorage, ExportNames, Shapes, MovieClips, Textures остаются
+// byte-for-byte как в оригинале).
+//
+// Вместо этого:
+//   1. Находим Shape по ID через sc2_parse (уже даёт export_name,
+//      commands с texture_index и UV bbox).
+//   2. Декодируем нужную KTX-текстуру (highres) тем же ASTC-декодером,
+//      что уже используется в png2sc_op.cpp для SC1.
+//   3. Патчим прямоугольник новым PNG (тот же billinear resize).
+//   4. Кодируем обратно тем же ASTC block size — размер в байтах
+//      гарантированно совпадает со старым (ASTC size зависит только
+//      от width/height/block_size, не от контента), поэтому можно
+//      заменить байты "на месте" внутри body, не трогая ничего
+//      вокруг (Header/DataStorage/ExportNames/Shapes/MovieClips
+//      остаются нетронутыми).
+//   5. Пересжимаем весь body через zstd и записываем: несжатый
+//      Header-дескриптор (без изменений) + новый сжатый body.
+//
+// Это специально НЕ универсальный FlatBuffers writer — только patch
+// уже существующего KTX-blob того же размера. Замена самой текстуры
+// на другое разрешение или добавление/удаление спрайтов этим путём
+// не поддерживается.
+
+#include "sc_core.h"
+#include "sc2_reader.h"
+#include "stb/stb_image.h"
+#include "astc_decoder.h"
+#include <sstream>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <vector>
+
+static const uint8_t SC2_KTX_MAGIC[12] = {
+    0xab,'K','T','X',' ','1','1',0xbb,0x0d,0x0a,0x1a,0x0a
+};
+
+struct Sc2GLBlock { uint32_t gl; int bw, bh; };
+static const Sc2GLBlock SC2_GL_BLOCKS[] = {
+    {0x93B0,4,4},{0x93B1,5,4},{0x93B2,5,5},{0x93B3,6,5},
+    {0x93B4,6,6},{0x93B5,8,5},{0x93B6,8,6},{0x93B7,8,8},
+    {0x93B8,10,5},{0x93B9,10,6},{0x93BA,10,8},{0x93BB,10,10},
+    {0x93BC,12,10},{0x93BD,12,12},
+    {0x93D0,4,4},{0x93D1,5,4},{0x93D2,5,5},{0x93D3,6,5},
+    {0x93D4,6,6},{0x93D5,8,5},{0x93D6,8,6},{0x93D7,8,8},
+    {0x93D8,10,5},{0x93D9,10,6},{0x93DA,10,8},{0x93DB,10,10},
+    {0x93DC,12,10},{0x93DD,12,12},{0,0,0}
+};
+
+static bool sc2_get_block(uint32_t gl, int& bw, int& bh) {
+    for (const auto* b = SC2_GL_BLOCKS; b->gl; b++)
+        if (b->gl == gl) { bw = b->bw; bh = b->bh; return true; }
+    bw = 8; bh = 8;
+    return false;
+}
+
+// Тот же KTX-декодер, что в png2sc_op.cpp, но самодостаточный здесь
+// (не переиспользуем static-функцию из другого .cpp напрямую).
+static bool sc2_decode_ktx_rgba(const uint8_t* d, size_t sz, int& w, int& h,
+                                 uint32_t& gl, int& bw, int& bh,
+                                 size_t& image_start, size_t& image_size,
+                                 std::vector<uint8_t>& rgba) {
+    if (sz < 64 || memcmp(d, SC2_KTX_MAGIC, 12) != 0) return false;
+    size_t p = 12;
+    auto rd32 = [&]() -> uint32_t {
+        if (p + 4 > sz) return 0;
+        uint32_t v; memcpy(&v, d + p, 4); p += 4; return v;
+    };
+    rd32(); rd32(); rd32(); rd32(); gl = rd32(); rd32();
+    w = (int)rd32(); h = (int)rd32();
+    rd32(); rd32(); rd32(); rd32();
+    uint32_t kvd = rd32();
+    if (p + (size_t)kvd + 4 > sz) return false;
+    p += kvd;
+    uint32_t img = rd32();
+    if (p + img > sz) return false;
+    image_start = p;
+    image_size = img;
+    if (!sc2_get_block(gl, bw, bh)) return false;
+    bool srgb = (gl >= 0x93D0 && gl <= 0x93DD);
+    return astc_decode(d + p, img, w, h, bw, bh, rgba, srgb);
+}
+
+// Заново проходит по тому же контейнеру/chunk-layout, что sc2_parse,
+// но возвращает "сырые" данные, нужные для patch: полный decompressed
+// body, абсолютный offset Textures-chunk payload внутри body, и байты
+// несжатого Header-дескриптора (чтобы записать его обратно как есть).
+struct Sc2RawLayout {
+    std::vector<uint8_t> header_bytes;   // "SC" + version + descriptor_size + descriptor, как есть
+    std::vector<uint8_t> body;           // весь decompressed body
+    size_t textures_payload_off = 0;     // offset payload Textures chunk внутри body
+    size_t textures_payload_len = 0;
+    uint32_t external_matrix_bank_size = 0;
+    std::vector<uint8_t> external_matrix_bank; // хвост после compressed-блока, если есть
+    bool valid = false;
+};
+
+static bool sc2_load_raw_layout(const std::vector<uint8_t>& file_data,
+                                 Sc2RawLayout& out, std::string* err) {
+    auto fail = [&](const char* msg) { if (err) *err = msg; return false; };
+
+    if (file_data.size() < 10 || file_data[0] != 'S' || file_data[1] != 'C')
+        return fail("not an SC file");
+
+    uint8_t version = file_data[2];
+    if (version < 5 || version > 6) return fail("not SC2 v5/v6");
+
+    size_t pos = 6;
+    if (version == 6) pos += 2;
+
+    if (pos + 4 > file_data.size()) return fail("truncated: no descriptor size");
+
+    auto rd_u32 = [&](size_t o) -> uint32_t {
+        uint32_t v; memcpy(&v, file_data.data() + o, 4); return v;
+    };
+
+    uint32_t descriptor_size = rd_u32(pos);
+    size_t descriptor_at = pos + 4;
+    pos += 4;
+    if (pos + descriptor_size > file_data.size()) return fail("truncated: descriptor");
+    pos += descriptor_size;
+
+    // Header — читаем нужные поля напрямую (та же vtable-логика,
+    // co-located с sc2_reader.cpp, но здесь достаточно нескольких
+    // полей: resources_offset, compressed_size, external_matrix_bank_size).
+    {
+        // Минимальный inline-reader вместо подключения fbs:: namespace
+        // из sc2_reader.cpp (он static/anonymous там).
+        const uint8_t* hb = file_data.data() + descriptor_at;
+        size_t hlen = descriptor_size;
+        if (hlen < 4) return fail("invalid Header flatbuffer");
+
+        uint32_t root_rel; memcpy(&root_rel, hb, 4);
+        size_t table_pos = root_rel;
+        if (table_pos + 4 > hlen) return fail("invalid Header root");
+
+        int32_t vt_off; memcpy(&vt_off, hb + table_pos, 4);
+        size_t vtable = (size_t)((int64_t)table_pos - vt_off);
+        if (vtable + 2 > hlen) return fail("invalid Header vtable");
+
+        uint16_t vtable_size; memcpy(&vtable_size, hb + vtable, 2);
+
+        auto field_u32 = [&](int index, uint32_t def) -> uint32_t {
+            size_t entry = 4 + (size_t)index * 2;
+            if (entry + 2 > vtable_size) return def;
+            uint16_t rel; memcpy(&rel, hb + vtable + entry, 2);
+            if (rel == 0) return def;
+            size_t field_pos = table_pos + rel;
+            if (field_pos + 4 > hlen) return def;
+            uint32_t v; memcpy(&v, hb + field_pos, 4);
+            return v;
+        };
+
+        uint32_t resources_offset          = field_u32(8, 0);
+        uint32_t compressed_size           = field_u32(11, 0);
+        uint32_t external_matrix_bank_size = field_u32(12, 0);
+        (void)resources_offset;
+
+        out.external_matrix_bank_size = external_matrix_bank_size;
+
+        size_t comp_len = compressed_size
+            ? compressed_size
+            : (file_data.size() - pos - external_matrix_bank_size);
+        if (pos + comp_len > file_data.size()) return fail("truncated: compressed body");
+
+        std::vector<uint8_t> comp(file_data.begin() + pos, file_data.begin() + pos + comp_len);
+
+        static const uint8_t ZSTD_MAGIC[4] = {0x28, 0xb5, 0x2f, 0xfd};
+        bool is_zstd = comp.size() >= 4 && memcmp(comp.data(), ZSTD_MAGIC, 4) == 0;
+
+        CompInfo ci{0, CompKind::ZSTD};
+        try {
+            out.body = is_zstd ? sc_decompress(comp, ci) : comp;
+        } catch (...) {
+            return fail("zstd decompress failed");
+        }
+
+        size_t tail_off = pos + comp_len;
+        if (external_matrix_bank_size > 0) {
+            if (tail_off + external_matrix_bank_size > file_data.size())
+                return fail("truncated: external matrix bank");
+            out.external_matrix_bank.assign(
+                file_data.begin() + tail_off,
+                file_data.begin() + tail_off + external_matrix_bank_size
+            );
+        }
+
+        // Header-дескриптор целиком (magic+version+descriptor_size+descriptor)
+        // остаётся байт-в-байт как в оригинале — сохраняем его как есть.
+        out.header_bytes.assign(file_data.begin(), file_data.begin() + pos);
+
+        // -- Повторяем chunk-layout body: DataStorage, затем 6 chunk'ов --
+        if (out.body.size() < 4) return fail("truncated body: no DataStorage size");
+
+        size_t bpos = 0;
+        uint32_t ds_size; memcpy(&ds_size, out.body.data(), 4);
+        bpos += 4;
+        if (bpos + ds_size > out.body.size()) return fail("truncated: DataStorage");
+        bpos += ds_size;
+
+        if (resources_offset < bpos || resources_offset > out.body.size())
+            return fail("resources_offset out of range");
+        bpos = resources_offset;
+
+        auto skip_chunk = [&](const char* name) -> bool {
+            if (bpos + 4 > out.body.size()) return false;
+            uint32_t sz; memcpy(&sz, out.body.data() + bpos, 4);
+            if (bpos + 4 + sz > out.body.size()) return false;
+            bpos += 4 + sz;
+            (void)name;
+            return true;
+        };
+
+        if (!skip_chunk("ExportNames"))        return fail("truncated: ExportNames chunk");
+        if (!skip_chunk("TextFields"))         return fail("truncated: TextFields chunk");
+        if (!skip_chunk("Shapes"))             return fail("truncated: Shapes chunk");
+        if (!skip_chunk("MovieClips"))         return fail("truncated: MovieClips chunk");
+        if (!skip_chunk("MovieClipModifiers")) return fail("truncated: MovieClipModifiers chunk");
+
+        // Textures — этот chunk патчим, запоминаем его точные границы.
+        if (bpos + 4 > out.body.size()) return fail("truncated: Textures chunk");
+        uint32_t tex_sz; memcpy(&tex_sz, out.body.data() + bpos, 4);
+        if (bpos + 4 + tex_sz > out.body.size()) return fail("truncated: Textures chunk");
+
+        out.textures_payload_off = bpos + 4;
+        out.textures_payload_len = tex_sz;
+    }
+
+    out.valid = true;
+    return true;
+}
+
+// ── Главная функция замены ──────────────────────────────────────────────────
+
+std::string sc2_png2sc(const std::string& png_path, const std::string& orig_sc,
+                        int shape_id, const std::string& out_dir) {
+
+    int pw, ph, pch;
+    uint8_t* loaded = stbi_load(png_path.c_str(), &pw, &ph, &pch, 4);
+    if (!loaded) return "Error: cannot load PNG: " + png_path;
+    std::vector<uint8_t> input(loaded, loaded + (size_t)pw * ph * 4);
+    stbi_image_free(loaded);
+
+    std::vector<uint8_t> file_data;
+    if (!sc_read_file(orig_sc, file_data))
+        return "Error: cannot read SC: " + orig_sc;
+
+    // 1. Найти Shape (для UV bbox и texture_index) через уже
+    //    протестированный sc2_parse.
+    Sc2File sc;
+    std::string sc2_err;
+    if (!sc2_parse(file_data, sc, &sc2_err))
+        return "Error: SC2 parse failed: " + sc2_err;
+
+    const Sc2Shape* target_shape = nullptr;
+    for (auto& s : sc.shapes) {
+        if (s.id == (uint16_t)shape_id) { target_shape = &s; break; }
+    }
+    if (!target_shape) return "Error: shape id " + std::to_string(shape_id) + " not found";
+
+    float min_u, min_v, max_u, max_v;
+    if (!sc2_shape_uv_bbox(*target_shape, min_u, min_v, max_u, max_v))
+        return "Error: shape has no vertices";
+
+    uint32_t texture_index = 0;
+    if (!target_shape->commands.empty())
+        texture_index = target_shape->commands[0].texture_index;
+
+    if (texture_index >= sc.textures.size())
+        return "Error: texture index " + std::to_string(texture_index) + " out of range";
+
+    auto& tex_meta = sc.textures[texture_index].highres;
+    if (!tex_meta.present) return "Error: target texture has no highres data";
+
+    // 2. Заново прочитать "сырой" layout — нужен полный body для patch
+    //    и точные границы Textures-chunk внутри него.
+    Sc2RawLayout layout;
+    std::string layout_err;
+    if (!sc2_load_raw_layout(file_data, layout, &layout_err))
+        return "Error: layout: " + layout_err;
+
+    if (layout.textures_payload_off + tex_meta.data_off + tex_meta.data_len >
+        layout.body.size()) {
+        return "Error: texture data out of range in body";
+    }
+
+    const uint8_t* ktx_ptr =
+        layout.body.data() + layout.textures_payload_off + tex_meta.data_off;
+
+    int kw = 0, kh = 0, bw = 8, bh = 8;
+    uint32_t gl = 0;
+    size_t image_start = 0, image_size = 0;
+    std::vector<uint8_t> atlas_rgba;
+
+    if (!sc2_decode_ktx_rgba(ktx_ptr, tex_meta.data_len, kw, kh, gl, bw, bh,
+                              image_start, image_size, atlas_rgba)) {
+        return "Error: KTX decode failed";
+    }
+
+    if (kw != tex_meta.width || kh != tex_meta.height) {
+        // Не фатально (некоторые файлы хранят чуть другие значения),
+        // но используем реальные декодированные размеры дальше.
+    }
+
+    // 3. Перевести нормализованный UV bbox в пиксели этой конкретной
+    //    текстуры и патчить прямоугольник новым PNG (billinear resize),
+    //    той же логикой, что и в png2sc_op.cpp для SC1.
+    int x0 = std::max(0, (int)std::floor(min_u * kw + 0.001f));
+    int y0 = std::max(0, (int)std::floor(min_v * kh + 0.001f));
+    int x1 = std::min(kw, (int)std::ceil(max_u * kw - 0.001f));
+    int y1 = std::min(kh, (int)std::ceil(max_v * kh - 0.001f));
+    int tw = x1 - x0, th = y1 - y0;
+    if (tw <= 0 || th <= 0) return "Error: empty target rectangle";
+
+    std::vector<uint8_t> repl((size_t)tw * th * 4);
+    float sx = (float)pw / tw, sy = (float)ph / th;
+    for (int y = 0; y < th; y++) {
+        for (int x = 0; x < tw; x++) {
+            float fx = (x + 0.5f) * sx - 0.5f, fy = (y + 0.5f) * sy - 0.5f;
+            int x0s = std::max(0, std::min(pw - 1, (int)std::floor(fx)));
+            int y0s = std::max(0, std::min(ph - 1, (int)std::floor(fy)));
+            int x1s = std::min(pw - 1, x0s + 1), y1s = std::min(ph - 1, y0s + 1);
+            float dx = std::max(0.f, std::min(1.f, fx - x0s));
+            float dy = std::max(0.f, std::min(1.f, fy - y0s));
+            for (int c = 0; c < 4; c++) {
+                float v = input[((size_t)y0s * pw + x0s) * 4 + c] * (1 - dx) * (1 - dy)
+                        + input[((size_t)y0s * pw + x1s) * 4 + c] * dx * (1 - dy)
+                        + input[((size_t)y1s * pw + x0s) * 4 + c] * (1 - dx) * dy
+                        + input[((size_t)y1s * pw + x1s) * 4 + c] * dx * dy;
+                repl[((size_t)y * tw + x) * 4 + c] = (uint8_t)std::lround(v);
+            }
+        }
+    }
+    for (int y = 0; y < th; y++)
+        memcpy(atlas_rgba.data() + ((size_t)(y + y0) * kw + x0) * 4,
+               repl.data() + (size_t)y * tw * 4, (size_t)tw * 4);
+
+    // 4. Кодируем обратно тем же ASTC block size. Размер в байтах
+    //    зависит только от (kw,kh,bw,bh), не от контента — совпадает
+    //    с исходным image_size гарантированно.
+    std::vector<uint8_t> encoded;
+    if (!astc_encode(atlas_rgba.data(), kw, kh, bw, bh, encoded))
+        return "Error: ASTC encode failed";
+    if (encoded.size() != image_size)
+        return "Error: encoded KTX size changed unexpectedly ("
+             + std::to_string(encoded.size()) + " vs " + std::to_string(image_size) + ")";
+
+    // 5. Патчим ровно эти байты внутри копии body, ничего больше
+    //    не трогаем (Header/DataStorage/ExportNames/Shapes/MovieClips
+    //    остаются byte-for-byte как в оригинале).
+    std::vector<uint8_t> new_body = layout.body;
+    size_t patch_at =
+        layout.textures_payload_off + tex_meta.data_off + image_start;
+
+    if (patch_at + encoded.size() > new_body.size())
+        return "Error: patch offset out of range";
+
+    memcpy(new_body.data() + patch_at, encoded.data(), encoded.size());
+
+    // 6. Пересжимаем body и записываем: header_bytes (без изменений)
+    //    + новый compressed body + external_matrix_bank (без изменений).
+    std::vector<uint8_t> new_comp;
+    try {
+        new_comp = sc_compress(new_body, CompKind::ZSTD);
+    } catch (std::exception& e) {
+        return std::string("Error: compress: ") + e.what();
+    }
+
+    std::vector<uint8_t> out_file = layout.header_bytes;
+    out_file.insert(out_file.end(), new_comp.begin(), new_comp.end());
+    if (!layout.external_matrix_bank.empty()) {
+        out_file.insert(out_file.end(),
+                         layout.external_matrix_bank.begin(),
+                         layout.external_matrix_bank.end());
+    }
+
+    /*
+     * ВАЖНО: Header.compressed_size (поле 11 в дескрипторе) хранит
+     * точный размер сжатого блока. Если он записан не как 0
+     * ("до конца файла"), после пересжатия он может не совпадать
+     * с новым new_comp.size() (zstd — недетерминированный по
+     * итоговому размеру между разными реализациями/уровнями).
+     *
+     * header_bytes копируется как есть, поэтому если файл использует
+     * explicit compressed_size, старое значение может разойтись
+     * с реальным новым размером блока и чтение сломается.
+     * Патчим это поле, если оно присутствует и ненулевое.
+     */
+    {
+        // Ищем то же поле[11] в скопированном дескрипторе и патчим,
+        // если оно было явно записано (не 0 "до конца файла").
+        uint8_t version = out_file[2];
+        size_t pos = 6;
+        if (version == 6) pos += 2;
+        uint32_t descriptor_size;
+        memcpy(&descriptor_size, out_file.data() + pos, 4);
+        size_t descriptor_at = pos + 4;
+
+        uint8_t* hb = out_file.data() + descriptor_at;
+        size_t hlen = descriptor_size;
+
+        uint32_t root_rel; memcpy(&root_rel, hb, 4);
+        size_t table_pos = root_rel;
+        int32_t vt_off; memcpy(&vt_off, hb + table_pos, 4);
+        size_t vtable = (size_t)((int64_t)table_pos - vt_off);
+        uint16_t vtable_size; memcpy(&vtable_size, hb + vtable, 2);
+
+        int index = 11; // compressed_size field
+        size_t entry = 4 + (size_t)index * 2;
+        if (entry + 2 <= vtable_size) {
+            uint16_t rel; memcpy(&rel, hb + vtable + entry, 2);
+            if (rel != 0) {
+                size_t field_pos = table_pos + rel;
+                if (field_pos + 4 <= hlen) {
+                    uint32_t old_val;
+                    memcpy(&old_val, hb + field_pos, 4);
+                    if (old_val != 0) {
+                        uint32_t new_val = (uint32_t)new_comp.size();
+                        memcpy(hb + field_pos, &new_val, 4);
+                    }
+                }
+            }
+        }
+    }
+
+    std::string stem = sc_basename_no_ext(orig_sc);
+    std::string out_path = out_dir + "/" + stem + "_patched.sc";
+    if (!sc_write_file(out_path, out_file))
+        return "Error: write failed: " + out_path;
+
+    std::ostringstream r;
+    r << "OK: PNG to SC2 (v" << (int)sc.version << ")\n";
+    r << "  Shape[" << shape_id << "] \"" << target_shape->export_name << "\""
+      << " -> texture[" << texture_index << "]\n";
+    r << "  Atlas: " << kw << "x" << kh << "  ASTC " << bw << "x" << bh << "\n";
+    r << "  Replaced: " << tw << "x" << th << " at (" << x0 << "," << y0 << ")\n";
+    r << "  PNG: " << pw << "x" << ph << " -> " << tw << "x" << th << "\n";
+    r << "  Output: " << stem << "_patched.sc\n";
+    r << "  Dir: " << out_dir;
+    return r.str();
+}

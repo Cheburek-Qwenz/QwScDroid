@@ -1,0 +1,379 @@
+/**
+ * png2sc_op.cpp — PNG to SC (точный порт Termux sc_tool)
+ * Логика 1:1 с Python: берём блок из оригинального KTX, кодируем напрямую.
+ */
+#include "sc_core.h"
+#include "stb/stb_image.h"
+#include "astc_decoder.h"
+#include <sstream>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <vector>
+#include <android/log.h>
+
+#define TAG "Png2SC"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+
+static const uint8_t KTX_MAGIC[12] = {
+    0xab,'K','T','X',' ','1','1',0xbb,0x0d,0x0a,0x1a,0x0a
+};
+
+struct GLBlock { uint32_t gl; int bw, bh; };
+static const GLBlock GL_BLOCKS[] = {
+    {0x93B0,4,4},{0x93B1,5,4},{0x93B2,5,5},{0x93B3,6,5},
+    {0x93B4,6,6},{0x93B5,8,5},{0x93B6,8,6},{0x93B7,8,8},
+    {0x93B8,10,5},{0x93B9,10,6},{0x93BA,10,8},{0x93BB,10,10},
+    {0x93BC,12,10},{0x93BD,12,12},
+    {0x93D0,4,4},{0x93D1,5,4},{0x93D2,5,5},{0x93D3,6,5},
+    {0x93D4,6,6},{0x93D5,8,5},{0x93D6,8,6},{0x93D7,8,8},
+    {0x93D8,10,5},{0x93D9,10,6},{0x93DA,10,8},{0x93DB,10,10},
+    {0x93DC,12,10},{0x93DD,12,12},{0,0,0}
+};
+
+static size_t mip0_size(int w, int h, int bw, int bh) {
+    return (size_t)((w+bw-1)/bw) * (size_t)((h+bh-1)/bh) * 16;
+}
+static bool get_block(uint32_t gl, int& bw, int& bh) {
+    for (const auto* b = GL_BLOCKS; b->gl; b++)
+        if (b->gl == gl) { bw=b->bw; bh=b->bh; return true; }
+    bw=8; bh=8; return false;
+}
+
+// MD5
+static uint32_t md5_T[64];
+static bool md5_init_done = false;
+static void md5_init_T() {
+    if (md5_init_done) return;
+    for (int i=0;i<64;i++) md5_T[i]=(uint32_t)(4294967296.0*fabs(sin(i+1.0)));
+    md5_init_done = true;
+}
+#define ROL(x,n) (((x)<<(n))|((x)>>(32-(n))))
+#define F(x,y,z) (((x)&(y))|(~(x)&(z)))
+#define G(x,y,z) (((x)&(z))|((y)&~(z)))
+#define H(x,y,z) ((x)^(y)^(z))
+#define I(x,y,z) ((y)^((x)|~(z)))
+#define STEP(f,a,b,c,d,k,s,i) a=b+ROL(a+f(b,c,d)+X[k]+md5_T[i-1],s)
+static void md5_block(uint32_t s[4], const uint8_t* blk) {
+    uint32_t X[16],a=s[0],b=s[1],c=s[2],d=s[3];
+    for(int i=0;i<16;i++) memcpy(&X[i],blk+i*4,4);
+    STEP(F,a,b,c,d,0,7,1);STEP(F,d,a,b,c,1,12,2);STEP(F,c,d,a,b,2,17,3);STEP(F,b,c,d,a,3,22,4);
+    STEP(F,a,b,c,d,4,7,5);STEP(F,d,a,b,c,5,12,6);STEP(F,c,d,a,b,6,17,7);STEP(F,b,c,d,a,7,22,8);
+    STEP(F,a,b,c,d,8,7,9);STEP(F,d,a,b,c,9,12,10);STEP(F,c,d,a,b,10,17,11);STEP(F,b,c,d,a,11,22,12);
+    STEP(F,a,b,c,d,12,7,13);STEP(F,d,a,b,c,13,12,14);STEP(F,c,d,a,b,14,17,15);STEP(F,b,c,d,a,15,22,16);
+    STEP(G,a,b,c,d,1,5,17);STEP(G,d,a,b,c,6,9,18);STEP(G,c,d,a,b,11,14,19);STEP(G,b,c,d,a,0,20,20);
+    STEP(G,a,b,c,d,5,5,21);STEP(G,d,a,b,c,10,9,22);STEP(G,c,d,a,b,15,14,23);STEP(G,b,c,d,a,4,20,24);
+    STEP(G,a,b,c,d,9,5,25);STEP(G,d,a,b,c,14,9,26);STEP(G,c,d,a,b,3,14,27);STEP(G,b,c,d,a,8,20,28);
+    STEP(G,a,b,c,d,13,5,29);STEP(G,d,a,b,c,2,9,30);STEP(G,c,d,a,b,7,14,31);STEP(G,b,c,d,a,12,20,32);
+    STEP(H,a,b,c,d,5,4,33);STEP(H,d,a,b,c,8,11,34);STEP(H,c,d,a,b,11,16,35);STEP(H,b,c,d,a,14,23,36);
+    STEP(H,a,b,c,d,1,4,37);STEP(H,d,a,b,c,4,11,38);STEP(H,c,d,a,b,7,16,39);STEP(H,b,c,d,a,10,23,40);
+    STEP(H,a,b,c,d,13,4,41);STEP(H,d,a,b,c,0,11,42);STEP(H,c,d,a,b,3,16,43);STEP(H,b,c,d,a,6,23,44);
+    STEP(H,a,b,c,d,9,4,45);STEP(H,d,a,b,c,12,11,46);STEP(H,c,d,a,b,15,16,47);STEP(H,b,c,d,a,2,23,48);
+    STEP(I,a,b,c,d,0,6,49);STEP(I,d,a,b,c,7,10,50);STEP(I,c,d,a,b,14,15,51);STEP(I,b,c,d,a,5,21,52);
+    STEP(I,a,b,c,d,12,6,53);STEP(I,d,a,b,c,3,10,54);STEP(I,c,d,a,b,10,15,55);STEP(I,b,c,d,a,1,21,56);
+    STEP(I,a,b,c,d,8,6,57);STEP(I,d,a,b,c,15,10,58);STEP(I,c,d,a,b,6,15,59);STEP(I,b,c,d,a,13,21,60);
+    STEP(I,a,b,c,d,4,6,61);STEP(I,d,a,b,c,11,10,62);STEP(I,c,d,a,b,2,15,63);STEP(I,b,c,d,a,9,21,64);
+    s[0]+=a; s[1]+=b; s[2]+=c; s[3]+=d;
+}
+static void compute_md5(const uint8_t* data, size_t len, uint8_t out[16]) {
+    md5_init_T();
+    uint32_t s[4]={0x67452301,0xefcdab89,0x98badcfe,0x10325476};
+    size_t i=0;
+    for(;i+64<=len;i+=64) md5_block(s,data+i);
+    uint8_t buf[128]={};
+    size_t rem=len-i; memcpy(buf,data+i,rem); buf[rem]=0x80;
+    uint64_t bits=(uint64_t)len*8;
+    if(rem<56){memcpy(buf+56,&bits,8);md5_block(s,buf);}
+    else{memcpy(buf+120,&bits,8);md5_block(s,buf);md5_block(s,buf+64);}
+    memcpy(out,s,16);
+}
+
+struct ShapePolygon {
+    uint16_t tex_idx = 0;
+    std::vector<std::pair<float,float>> uv;
+};
+
+struct ShapeGeometry {
+    uint16_t id = 0;
+    uint16_t tex_idx = 0;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    std::vector<ShapePolygon> polygons;
+    bool valid = false;
+};
+
+static bool find_shape_geometry(const std::vector<uint8_t>& raw, uint16_t wanted_id,
+                                int atlas_w, int atlas_h, ShapeGeometry& out) {
+    size_t p=0;
+    auto r8=[&]()->uint8_t{ return p<raw.size()?raw[p++]:0; };
+    auto r16=[&]()->uint16_t{ if(p+2>raw.size()){p=raw.size();return 0;} uint16_t v; memcpy(&v,raw.data()+p,2);p+=2;return v; };
+    auto r32=[&]()->uint32_t{ if(p+4>raw.size()){p=raw.size();return 0;} uint32_t v;memcpy(&v,raw.data()+p,4);p+=4;return v; };
+    if(raw.size()<19) return false;
+    r16();r16();r16();r16();r16();r16(); p += 5;
+    uint16_t ec=r16();
+    if(ec>10000) return false;
+    for(uint16_t i=0;i<ec;i++) r16();
+    for(uint16_t i=0;i<ec;i++) { uint8_t n=r8(); if(n==0xFF) p+=2; p+=n; if(p>raw.size()) return false; }
+
+    while(p+5<=raw.size()) {
+        uint8_t tag=r8(); int32_t len=(int32_t)r32();
+        if(tag==0) break;
+        if(len<0 || p+(size_t)len>raw.size()) return false;
+        size_t start=p,end=p+(size_t)len;
+        if((tag==2 || tag==18) && end-start>=4) {
+            uint16_t id=r16(); uint16_t draw_c=r16();
+            if(tag==18 && p+2<=end) r16();
+
+            ShapeGeometry geom;
+            geom.id = id;
+            float min_u=1e30f,min_v=1e30f,max_u=-1e30f,max_v=-1e30f;
+
+            for(uint16_t d=0; d<draw_c && p+5<=end; ++d) {
+                uint8_t ctag=r8(); int32_t clen=(int32_t)r32();
+                if(clen<0 || p+(size_t)clen>end) break;
+                size_t ce=p+(size_t)clen;
+                if(id==wanted_id && (ctag==4 || ctag==17 || ctag==22) && p<ce) {
+                    uint8_t tex=(uint8_t)r8();
+                    uint16_t vc=4;
+                    if(ctag!=4 && p<ce) vc=r8();
+                    if(vc>=3 && p+(size_t)vc*12<=ce) {
+                        p += (size_t)vc*8; // X/Y int32 pairs
+                        ShapePolygon poly;
+                        poly.tex_idx=tex;
+                        poly.uv.reserve(vc);
+                        for(uint16_t i=0;i<vc;i++) {
+                            uint16_t u=r16(),v=r16();
+                            float uf=(float)u/65535.0f*atlas_w;
+                            float vf=(float)v/65535.0f*atlas_h;
+                            poly.uv.emplace_back(uf,vf);
+                            min_u=std::min(min_u,uf); max_u=std::max(max_u,uf);
+                            min_v=std::min(min_v,vf); max_v=std::max(max_v,vf);
+                        }
+                        if(!poly.uv.empty()) geom.polygons.push_back(std::move(poly));
+                    }
+                }
+                p=ce;
+            }
+
+            if(id==wanted_id && !geom.polygons.empty()) {
+                geom.tex_idx=geom.polygons.front().tex_idx;
+                geom.x0=std::max(0,(int)std::floor(min_u));
+                geom.y0=std::max(0,(int)std::floor(min_v));
+                geom.x1=std::min(atlas_w,(int)std::ceil(max_u));
+                geom.y1=std::min(atlas_h,(int)std::ceil(max_v));
+                geom.valid=geom.x1>geom.x0 && geom.y1>geom.y0;
+                if(geom.valid) { out=std::move(geom); return true; }
+            }
+        }
+        p=end;
+    }
+    return false;
+}
+
+static float edge_fn(float ax,float ay,float bx,float by,float px,float py) {
+    return (px-ax)*(by-ay)-(py-ay)*(bx-ax);
+}
+
+static bool point_in_triangle(float px,float py,
+                              const std::pair<float,float>& a,
+                              const std::pair<float,float>& b,
+                              const std::pair<float,float>& c) {
+    float e1=edge_fn(a.first,a.second,b.first,b.second,px,py);
+    float e2=edge_fn(b.first,b.second,c.first,c.second,px,py);
+    float e3=edge_fn(c.first,c.second,a.first,a.second,px,py);
+    const float eps=0.001f;
+    return (e1>=-eps && e2>=-eps && e3>=-eps) ||
+           (e1<=eps && e2<=eps && e3<=eps);
+}
+
+static bool point_in_polygon_fan(float px,float py,const ShapePolygon& poly) {
+    if(poly.uv.size()<3) return false;
+    const auto& root=poly.uv[0];
+    for(size_t i=1;i+1<poly.uv.size();++i)
+        if(point_in_triangle(px,py,root,poly.uv[i],poly.uv[i+1])) return true;
+    return false;
+}
+
+static bool decode_ktx_rgba(const uint8_t* d, size_t sz, int& w, int& h,
+                            uint32_t& gl, int& bw, int& bh,
+                            size_t& image_start, size_t& image_size,
+                            std::vector<uint8_t>& rgba) {
+    if(sz<64 || memcmp(d,KTX_MAGIC,12)!=0) return false;
+    size_t p=12;
+    auto rd32=[&]()->uint32_t{ if(p+4>sz) return 0; uint32_t v; memcpy(&v,d+p,4); p+=4; return v; };
+    rd32(); rd32(); rd32(); rd32(); gl=rd32(); rd32();
+    w=(int)rd32(); h=(int)rd32();
+    rd32(); rd32(); rd32(); rd32();
+    uint32_t kvd=rd32();
+    if(p+(size_t)kvd+4>sz) return false;
+    p+=kvd;
+    uint32_t img=rd32();
+    if(p+img>sz) return false;
+    image_start=p; image_size=img;
+    if(!get_block(gl,bw,bh)) return false;
+    bool srgb=(gl>=0x93D0 && gl<=0x93DD);
+    return astc_decode(d+p,img,w,h,bw,bh,rgba,srgb);
+}
+
+static std::vector<uint8_t> make_ktx_from_header(const uint8_t* old, size_t header_bytes,
+                                                  const std::vector<uint8_t>& pixels) {
+    std::vector<uint8_t> out(old, old+header_bytes);
+    if(header_bytes<64) return {};
+    uint32_t image_size=(uint32_t)pixels.size();
+    memcpy(out.data()+header_bytes-4, &image_size, 4);
+    out.insert(out.end(),pixels.begin(),pixels.end());
+    return out;
+}
+
+std::string png2sc(const std::string& png_path, const std::string& orig_sc,
+                   int idx, int rotate_deg, const std::string& out_dir) {
+    int pw,ph,ch;
+    uint8_t* loaded=stbi_load(png_path.c_str(),&pw,&ph,&ch,4);
+    if(!loaded) return "Error: cannot load PNG: "+png_path;
+    std::vector<uint8_t> input(loaded,loaded+(size_t)pw*ph*4);
+    stbi_image_free(loaded);
+
+    int actual_rotate=((rotate_deg%360)+360)%360;
+    if(actual_rotate!=0) {
+        int nw=(actual_rotate==90||actual_rotate==270)?ph:pw;
+        int nh=(actual_rotate==90||actual_rotate==270)?pw:ph;
+        std::vector<uint8_t> rot((size_t)nw*nh*4);
+        for(int y=0;y<ph;y++) for(int x=0;x<pw;x++) {
+            int nx,ny;
+            if(actual_rotate==90){nx=ph-1-y;ny=x;}
+            else if(actual_rotate==180){nx=pw-1-x;ny=ph-1-y;}
+            else {nx=y;ny=pw-1-x;}
+            memcpy(rot.data()+((size_t)ny*nw+nx)*4,input.data()+((size_t)y*pw+x)*4,4);
+        }
+        input.swap(rot); pw=nw; ph=nh;
+    }
+
+    std::vector<uint8_t> sc_data;
+    if(!sc_read_file(orig_sc,sc_data)) return "Error: cannot read SC: "+orig_sc;
+    ScHeader hdr=sc_parse_header(sc_data);
+    if(!hdr.valid) return "Error: not an SC file";
+    std::vector<uint8_t> raw;
+    try { raw=sc_decompress(sc_data,hdr.comp); }
+    catch(std::exception& e) { return std::string("Error: decompress: ")+e.what(); }
+
+    // Locate KTX blocks and decode their atlases.
+    struct KTXInfo { size_t off,end,image_start,image_size; int w,h,bw,bh; uint32_t gl; std::vector<uint8_t> rgba; };
+    std::vector<KTXInfo> ktxs;
+    for(size_t i=0;i+64<=raw.size();i++) {
+        if(memcmp(raw.data()+i,KTX_MAGIC,12)!=0) continue;
+        int w=0,h=0,bw=8,bh=8; uint32_t gl=0; size_t is=0,isz=0; std::vector<uint8_t> rgba;
+        if(!decode_ktx_rgba(raw.data()+i,raw.size()-i,w,h,gl,bw,bh,is,isz,rgba)) continue;
+        size_t end=i+is+isz;
+        ktxs.push_back({i,end,i+is,isz,w,h,bw,bh,gl,std::move(rgba)});
+        i=end>i?end-1:i;
+    }
+    if(ktxs.empty()) return "Error: no decodable KTX found";
+
+    // idx is a Shape ID for the editor. If it isn't a Shape, preserve the
+    // legacy behavior and interpret it as a KTX index.
+    ShapeGeometry geom;
+    bool has_shape=false;
+    for(auto& k:ktxs) {
+        if(find_shape_geometry(raw,(uint16_t)std::max(0,idx),k.w,k.h,geom)) {
+            if(geom.tex_idx<(uint16_t)ktxs.size()) {
+                // tex_idx is normally the KTX order inside the SC.
+                has_shape=true;
+            }
+            break;
+        }
+    }
+
+    int target=-1;
+    if(has_shape) target=(int)geom.tex_idx;
+    else if(idx>=0 && idx<(int)ktxs.size()) target=idx;
+    else {
+        for(int i=0;i<(int)ktxs.size();i++) if(ktxs[i].w==pw&&ktxs[i].h==ph){target=i;break;}
+        if(target<0) target=(int)ktxs.size()-1;
+    }
+    if(target<0 || target>=(int)ktxs.size()) return "Error: invalid target texture";
+
+    KTXInfo& k=ktxs[target];
+    std::vector<uint8_t> atlas=k.rgba;
+    int x0=0,y0=0,x1=k.w,y1=k.h;
+    if(has_shape) {
+        x0=std::max(0,std::min(k.w,geom.x0)); y0=std::max(0,std::min(k.h,geom.y0));
+        x1=std::max(x0,std::min(k.w,geom.x1)); y1=std::max(y0,std::min(k.h,geom.y1));
+    }
+    int tw=x1-x0, th=y1-y0;
+    if(tw<=0||th<=0) return "Error: empty target rectangle";
+
+    // Resize only the replacement sprite to its existing atlas rectangle.
+    std::vector<uint8_t> repl((size_t)tw*th*4);
+    float sx=(float)pw/tw, sy=(float)ph/th;
+    for(int y=0;y<th;y++) for(int x=0;x<tw;x++) {
+        float fx=(x+0.5f)*sx-0.5f, fy=(y+0.5f)*sy-0.5f;
+        int x0s=std::max(0,std::min(pw-1,(int)std::floor(fx)));
+        int y0s=std::max(0,std::min(ph-1,(int)std::floor(fy)));
+        int x1s=std::min(pw-1,x0s+1), y1s=std::min(ph-1,y0s+1);
+        float dx=std::max(0.f,std::min(1.f,fx-x0s)), dy=std::max(0.f,std::min(1.f,fy-y0s));
+        for(int c=0;c<4;c++) {
+            float v=input[((size_t)y0s*pw+x0s)*4+c]*(1-dx)*(1-dy)
+                    +input[((size_t)y0s*pw+x1s)*4+c]*dx*(1-dy)
+                    +input[((size_t)y1s*pw+x0s)*4+c]*(1-dx)*dy
+                    +input[((size_t)y1s*pw+x1s)*4+c]*dx*dy;
+            repl[((size_t)y*tw+x)*4+c]=(uint8_t)std::lround(v);
+        }
+    }
+    // IMPORTANT: only pixels covered by the actual Shape geometry are replaced.
+    // The bounding box is used only to scale the incoming PNG, never as the write mask.
+    if(has_shape) {
+        for(int y=0;y<th;y++) {
+            for(int x=0;x<tw;x++) {
+                float ax=(float)x0+(float)x+0.5f;
+                float ay=(float)y0+(float)y+0.5f;
+                bool inside=false;
+                for(const auto& poly : geom.polygons) {
+                    if(poly.tex_idx != geom.tex_idx) continue;
+                    if(point_in_polygon_fan(ax,ay,poly)) { inside=true; break; }
+                }
+                if(inside) {
+                    memcpy(atlas.data()+((size_t)(y+y0)*k.w+(x+x0))*4,
+                           repl.data()+((size_t)y*tw+x)*4,4);
+                }
+            }
+        }
+    } else {
+        for(int y=0;y<th;y++)
+            memcpy(atlas.data()+((size_t)(y+y0)*k.w+x0)*4,
+                   repl.data()+(size_t)y*tw*4,(size_t)tw*4);
+    }
+
+    std::vector<uint8_t> encoded;
+    if(!astc_encode(atlas.data(),k.w,k.h,k.bw,k.bh,encoded)) return "Error: ASTC encode failed";
+    if(encoded.size()!=k.image_size) return "Error: encoded KTX size changed unexpectedly";
+
+    // Replace only the KTX image bytes. Header, dimensions, GL format and
+    // surrounding SC structure remain byte-for-byte compatible.
+    std::vector<uint8_t> new_raw=raw;
+    memcpy(new_raw.data()+k.image_start,encoded.data(),encoded.size());
+
+    std::vector<uint8_t> sc_hdr(sc_data.begin(),sc_data.begin()+hdr.comp.offset);
+    if(sc_hdr.size()>=16) {
+        uint8_t digest[16]; compute_md5(new_raw.data(),new_raw.size(),digest);
+        memcpy(sc_hdr.data()+sc_hdr.size()-16,digest,16);
+    }
+    std::vector<uint8_t> comp;
+    try { comp=sc_compress(new_raw,hdr.comp.kind); }
+    catch(std::exception& e) { return std::string("Error: compress: ")+e.what(); }
+    sc_hdr.insert(sc_hdr.end(),comp.begin(),comp.end());
+
+    std::string stem=sc_basename_no_ext(orig_sc);
+    if(stem.size()<4 || stem.substr(stem.size()-4)!="_tex") stem+="_tex";
+    std::string out_path=out_dir+"/"+stem+".sc";
+    if(!sc_write_file(out_path,sc_hdr)) return "Error: write failed: "+out_path;
+
+    std::ostringstream r;
+    r<<"OK: PNG to SC\n";
+    if(has_shape) r<<"  Shape["<<idx<<"] -> KTX["<<target<<"]\n";
+    else r<<"  KTX["<<target<<"] (legacy mode)\n";
+    r<<"  Atlas: "<<k.w<<"x"<<k.h<<"  ASTC "<<k.bw<<"x"<<k.bh<<"\n";
+    r<<"  Replaced: "<<tw<<"x"<<th<<" at ("<<x0<<","<<y0<<")\n";
+    r<<"  PNG: "<<pw<<"x"<<ph<<" -> "<<tw<<"x"<<th<<"\n";
+    r<<"  Output: "<<stem<<".sc\n";
+    r<<"  Dir: "<<out_dir;
+    return r.str();
+}

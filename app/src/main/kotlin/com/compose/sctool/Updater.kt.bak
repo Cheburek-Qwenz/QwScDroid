@@ -1,0 +1,197 @@
+package com.compose.sctool
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.*
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.coroutines.coroutineContext
+
+/** Настройки автообновления. Впиши свой репозиторий. */
+object UpdateConfig {
+    const val GITHUB_REPO = "OWNER/REPO"          // например "cheburek/qwscdroid-releases"
+    const val INCLUDE_PRERELEASES = true
+    const val AUTO_CHECK_INTERVAL_MS = 6L * 60 * 60 * 1000
+}
+
+data class UpdateInfo(val version: String, val notes: String, val apkUrl: String, val size: Long)
+
+sealed class CheckResult {
+    data class Available(val info: UpdateInfo) : CheckResult()
+    object UpToDate : CheckResult()
+    object NotConfigured : CheckResult()
+    data class Error(val msg: String) : CheckResult()
+}
+
+object Updater {
+    fun currentVersion(ctx: Context): String = try {
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "0"
+    } catch (_: Exception) { "0" }
+
+    fun parseVersion(v: String): List<Int> =
+        Regex("\\d+").findAll(v.removePrefix("v")).map { it.value.toIntOrNull() ?: 0 }.toList()
+
+    fun isNewer(remote: String, local: String): Boolean {
+        val r = parseVersion(remote); val l = parseVersion(local)
+        for (i in 0 until maxOf(r.size, l.size)) {
+            val a = r.getOrElse(i) { 0 }; val b = l.getOrElse(i) { 0 }
+            if (a != b) return a > b
+        }
+        return false
+    }
+
+    suspend fun check(ctx: Context): CheckResult = withContext(Dispatchers.IO) {
+        if (UpdateConfig.GITHUB_REPO.startsWith("OWNER/")) return@withContext CheckResult.NotConfigured
+        try {
+            val c = URL("https://api.github.com/repos/${UpdateConfig.GITHUB_REPO}/releases?per_page=10")
+                .openConnection() as HttpURLConnection
+            c.connectTimeout = 10000; c.readTimeout = 15000
+            c.setRequestProperty("Accept", "application/vnd.github+json")
+            if (c.responseCode != 200) return@withContext CheckResult.Error("HTTP ${c.responseCode}")
+            val arr = JSONArray(c.inputStream.bufferedReader().readText())
+            c.disconnect()
+            val local = currentVersion(ctx)
+            var best: UpdateInfo? = null
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                if (o.optBoolean("draft")) continue
+                if (o.optBoolean("prerelease") && !UpdateConfig.INCLUDE_PRERELEASES) continue
+                val tag = o.optString("tag_name")
+                val assets = o.optJSONArray("assets") ?: continue
+                var apk: org.json.JSONObject? = null
+                for (j in 0 until assets.length()) {
+                    val a = assets.getJSONObject(j)
+                    if (a.optString("name").endsWith(".apk", true)) { apk = a; break }
+                }
+                if (apk == null) continue
+                if (best == null || isNewer(tag, best.version))
+                    best = UpdateInfo(tag, o.optString("body"), apk.optString("browser_download_url"), apk.optLong("size"))
+            }
+            val result: CheckResult =
+                if (best != null && isNewer(best.version, local)) CheckResult.Available(best)
+                else CheckResult.UpToDate
+            result
+        } catch (e: Exception) {
+            CheckResult.Error(e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    suspend fun download(ctx: Context, info: UpdateInfo, onProgress: (Float) -> Unit): File =
+        withContext(Dispatchers.IO) {
+            val dir = File(ctx.cacheDir, "update").apply { deleteRecursively(); mkdirs() }
+            val out = File(dir, "update.apk")
+            val c = URL(info.apkUrl).openConnection() as HttpURLConnection
+            c.connectTimeout = 15000; c.readTimeout = 30000
+            c.instanceFollowRedirects = true
+            val total = if (c.contentLengthLong > 0) c.contentLengthLong else info.size
+            c.inputStream.use { inp ->
+                out.outputStream().use { os ->
+                    val buf = ByteArray(64 * 1024); var done = 0L
+                    while (true) {
+                        coroutineContext.ensureActive()
+                        val n = inp.read(buf); if (n < 0) break
+                        os.write(buf, 0, n); done += n
+                        if (total > 0) onProgress(done.toFloat() / total)
+                    }
+                }
+            }
+            c.disconnect()
+            val pi = ctx.packageManager.getPackageArchiveInfo(out.absolutePath, 0)
+            if (pi == null || pi.packageName != ctx.packageName)
+                throw IllegalStateException("APK не подходит (другой пакет)")
+            out
+        }
+
+    /** false — нужно сначала разрешить установку из этого источника. */
+    fun install(ctx: Context, apk: File): Boolean {
+        if (Build.VERSION.SDK_INT >= 26 && !ctx.packageManager.canRequestPackageInstalls()) {
+            ctx.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:${ctx.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            return false
+        }
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", apk)
+        ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+        return true
+    }
+}
+
+/** Ставится один раз в Scaffold. manualToken++ — ручная проверка. */
+@Composable
+fun UpdateChecker(isRu: Boolean, manualToken: Int) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var info by remember { mutableStateOf<UpdateInfo?>(null) }
+    var msg by remember { mutableStateOf<String?>(null) }
+    var progress by remember { mutableStateOf<Float?>(null) }
+
+    suspend fun run(manual: Boolean) {
+        when (val r = Updater.check(ctx)) {
+            is CheckResult.Available -> info = r.info
+            is CheckResult.UpToDate -> if (manual) msg = if (isRu) "У вас последняя версия" else "You're up to date"
+            is CheckResult.NotConfigured -> if (manual) msg = if (isRu) "Репозиторий не задан (UpdateConfig)" else "Repo not configured"
+            is CheckResult.Error -> if (manual) msg = (if (isRu) "Ошибка: " else "Error: ") + r.msg
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val p = ctx.getSharedPreferences("upd", Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        if (now - p.getLong("last", 0) > UpdateConfig.AUTO_CHECK_INTERVAL_MS) {
+            p.edit().putLong("last", now).apply()
+            run(false)
+        }
+    }
+    LaunchedEffect(manualToken) { if (manualToken > 0) run(true) }
+
+    info?.let { u ->
+        AlertDialog(
+            onDismissRequest = { if (progress == null) info = null },
+            title = { Text((if (isRu) "Доступно обновление " else "Update ") + u.version) },
+            text = {
+                Column {
+                    Text(u.notes.ifBlank { "—" }.take(600))
+                    progress?.let { LinearProgressIndicator(progress = { it }, modifier = Modifier.padding(top = 12.dp).fillMaxWidth()) }
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = progress == null, onClick = {
+                    progress = 0f
+                    scope.launch {
+                        try {
+                            val f = Updater.download(ctx, u) { progress = it }
+                            progress = null; info = null
+                            if (!Updater.install(ctx, f))
+                                msg = if (isRu) "Разрешите установку и нажмите «Проверить обновления» снова" else "Allow installs, then check again"
+                        } catch (e: Exception) {
+                            progress = null
+                            msg = (if (isRu) "Ошибка: " else "Error: ") + (e.message ?: "")
+                        }
+                    }
+                }) { Text(if (isRu) "Обновить" else "Update") }
+            },
+            dismissButton = { TextButton(enabled = progress == null, onClick = { info = null }) { Text(if (isRu) "Позже" else "Later") } }
+        )
+    }
+    msg?.let {
+        AlertDialog(onDismissRequest = { msg = null }, text = { Text(it) },
+            confirmButton = { TextButton(onClick = { msg = null }) { Text("OK") } })
+    }
+}

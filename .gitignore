@@ -1,0 +1,24 @@
+# сборка
+build/
+.gradle/
+.idea/
+*.iml
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+obj/
+libs/
+# подпись и секреты
+*.jks
+*.keystore
+keystore.properties
+*.pem
+# файлы игры и тесты
+*.sc
+*.sctx
+*.ktx
+*.zip
+*.apk
+*.aab
+.DS_Store
